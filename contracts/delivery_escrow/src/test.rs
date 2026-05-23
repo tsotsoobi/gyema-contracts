@@ -8,6 +8,7 @@ use soroban_sdk::{
 };
 
 const HOUR: u64 = 3_600;
+#[allow(dead_code)]
 const DAY: u64 = 86_400;
 const FEE: i128 = 1_000;
 const BOND: i128 = 500;
@@ -146,7 +147,10 @@ fn test_full_happy_path_customer_confirms() {
     assert_eq!(alloc.to_platform, platform_cut);
 
     // Final balances:
-    assert_eq!(s.token.balance(&s.rider), INITIAL_BALANCE - BOND + rider_take);
+    assert_eq!(
+        s.token.balance(&s.rider),
+        INITIAL_BALANCE - BOND + rider_take
+    );
     assert_eq!(s.token.balance(&s.platform_wallet), platform_cut);
     assert_eq!(s.token.balance(&s.customer), INITIAL_BALANCE - FEE);
     assert_eq!(s.token.balance(&s.contract_addr), 0);
@@ -208,7 +212,10 @@ fn test_dispute_then_admin_resolves_partial_refund() {
     let result = s.client.resolve_dispute(&s.admin, &order.order_id, &alloc);
     assert_eq!(result.to_customer, to_customer);
 
-    assert_eq!(s.token.balance(&s.customer), INITIAL_BALANCE - FEE + to_customer);
+    assert_eq!(
+        s.token.balance(&s.customer),
+        INITIAL_BALANCE - FEE + to_customer
+    );
     assert_eq!(s.token.balance(&s.rider), INITIAL_BALANCE - BOND + to_rider);
     assert_eq!(s.token.balance(&s.platform_wallet), to_platform);
 
@@ -277,7 +284,9 @@ fn test_resolve_before_evidence_window_fails() {
         to_platform: 0,
         forfeit: 0,
     };
-    let result = s.client.try_resolve_dispute(&s.admin, &order.order_id, &alloc);
+    let result = s
+        .client
+        .try_resolve_dispute(&s.admin, &order.order_id, &alloc);
     assert!(result.is_err());
 }
 
@@ -298,7 +307,9 @@ fn test_resolve_allocation_sum_mismatch_fails() {
         to_platform: 400,
         forfeit: 0,
     };
-    let result = s.client.try_resolve_dispute(&s.admin, &order.order_id, &bad);
+    let result = s
+        .client
+        .try_resolve_dispute(&s.admin, &order.order_id, &bad);
     assert!(result.is_err());
 }
 
