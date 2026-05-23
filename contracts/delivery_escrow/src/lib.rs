@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(deprecated)]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token::TokenClient, Address,
@@ -19,10 +20,12 @@ const SECS_PER_LEDGER: u64 = 5;
 // ---------------------------------------------------------------------------
 /// Default window (seconds) after `mark_delivered` during which the customer
 /// can confirm or dispute. After this window the rider may claim funds.
+#[allow(dead_code)]
 const DEFAULT_CONFIRMATION_WINDOW_SECS: u64 = 86_400; // 24 hours
 
 /// Default window (seconds) after `dispute` during which both parties can
 /// submit evidence before the admin may rule.
+#[allow(dead_code)]
 const DEFAULT_EVIDENCE_WINDOW_SECS: u64 = 172_800; // 48 hours
 
 /// Maximum allowed confirmation window (caps merchant/admin configuration).
@@ -298,7 +301,6 @@ fn standard_payout(env: &Env, order: &Order) -> Result<Allocation, ContractError
         .ok_or(ContractError::InvalidAmount)?
         .checked_add(order.rider_bond)
         .ok_or(ContractError::TimestampOverflow)?;
-    let _ = env; // silence warning in non-test builds
     Ok(Allocation {
         to_customer: 0,
         to_rider: rider_take,
@@ -748,7 +750,7 @@ impl DeliveryEscrowContract {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin = get_admin(&env);
         admin.require_auth();
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
         env.events()
             .publish((symbol_short!("upgrade"),), new_wasm_hash);
     }
