@@ -336,12 +336,7 @@ fn execute_payout(env: &Env, order: &Order, a: &Allocation) {
 impl DeliveryEscrowContract {
     // ---- Constructor ------------------------------------------------------
 
-    pub fn __constructor(
-        env: Env,
-        admin: Address,
-        token: Address,
-        platform_fee_wallet: Address,
-    ) {
+    pub fn __constructor(env: Env, admin: Address, token: Address, platform_fee_wallet: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
         env.storage()
@@ -382,8 +377,7 @@ impl DeliveryEscrowContract {
         if platform_fee_bps > MAX_PLATFORM_FEE_BPS {
             return Err(ContractError::InvalidFeeBps);
         }
-        if confirmation_window_secs == 0
-            || confirmation_window_secs > MAX_CONFIRMATION_WINDOW_SECS
+        if confirmation_window_secs == 0 || confirmation_window_secs > MAX_CONFIRMATION_WINDOW_SECS
         {
             return Err(ContractError::InvalidWindow);
         }
@@ -482,11 +476,7 @@ impl DeliveryEscrowContract {
     /// during which the customer can confirm or dispute. If the customer
     /// does neither before the window closes, the rider can call
     /// `claim_after_timeout` to receive payout.
-    pub fn mark_delivered(
-        env: Env,
-        rider: Address,
-        order_id: u64,
-    ) -> Result<Order, ContractError> {
+    pub fn mark_delivered(env: Env, rider: Address, order_id: u64) -> Result<Order, ContractError> {
         let mut order = load_order(&env, order_id)?;
         require_status(&order, OrderStatus::Funded)?;
 
