@@ -1,5 +1,6 @@
 #![no_std]
 #![allow(deprecated)]
+#![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token::TokenClient, Address,
@@ -289,11 +290,11 @@ fn validate_allocation(a: &Allocation, pot: i128) -> Result<(), ContractError> {
 
 /// Standard happy-path payout: rider gets delivery_fee minus platform fee,
 /// plus their bond back; platform wallet gets the fee.
-fn standard_payout(env: &Env, order: &Order) -> Result<Allocation, ContractError> {
+fn standard_payout(_env: &Env, order: &Order) -> Result<Allocation, ContractError> {
     let platform_cut = order
         .delivery_fee
         .checked_mul(order.platform_fee_bps as i128)
-        .and_then(|x| Some(x / BPS_DENOMINATOR))
+        .map(|x| x / BPS_DENOMINATOR)
         .ok_or(ContractError::TimestampOverflow)?;
     let rider_take = order
         .delivery_fee
@@ -360,6 +361,7 @@ impl DeliveryEscrowContract {
     /// We separate `create` from `fund` so the customer can review the rider's
     /// acceptance before parting with funds, and so a frontend can show the
     /// full agreed terms before any token transfer.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_order(
         env: Env,
         customer: Address,
@@ -589,11 +591,7 @@ impl DeliveryEscrowContract {
     ///   - Customer disputes when goods are wrong/missing/damaged.
     ///   - Rider may need to dispute when, e.g., the customer is refusing
     ///     delivery or the address turned out to be fraudulent.
-    pub fn dispute(
-        env: Env,
-        caller: Address,
-        order_id: u64,
-    ) -> Result<Order, ContractError> {
+    pub fn dispute(env: Env, caller: Address, order_id: u64) -> Result<Order, ContractError> {
         let mut order = load_order(&env, order_id)?;
         require_status(&order, OrderStatus::Delivered)?;
 
@@ -750,7 +748,8 @@ impl DeliveryEscrowContract {
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let admin = get_admin(&env);
         admin.require_auth();
-        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
         env.events()
             .publish((symbol_short!("upgrade"),), new_wasm_hash);
     }
