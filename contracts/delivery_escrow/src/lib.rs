@@ -841,10 +841,8 @@ impl DeliveryEscrowContract {
         save_order(&env, &order);
         bump_instance(&env);
 
-        env.events().publish(
-            (symbol_short!("cnl_prop"),),
-            (order.order_id, caller),
-        );
+        env.events()
+            .publish((symbol_short!("cnl_prop"),), (order.order_id, caller));
 
         Ok(order)
     }
@@ -855,11 +853,7 @@ impl DeliveryEscrowContract {
     /// proposer, so cancellation still requires both parties' consent, just
     /// expressed in two single-auth transactions instead of one dual-auth
     /// transaction.
-    pub fn accept_cancel(
-        env: Env,
-        caller: Address,
-        order_id: u64,
-    ) -> Result<Order, ContractError> {
+    pub fn accept_cancel(env: Env, caller: Address, order_id: u64) -> Result<Order, ContractError> {
         let mut order = load_order(&env, order_id)?;
         require_status(&order, OrderStatus::Funded)?;
 
