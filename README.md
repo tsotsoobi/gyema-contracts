@@ -65,7 +65,7 @@ For the delivery escrow specifically, the design optimizes for known fraud-resis
 
 - **Customer-confirms primary.** Only the customer can verify correct delivery. Rider self-confirmation is a known fraud vector and is not offered.
 - **Rider timeout escape valve.** Customer silence past the confirmation window allows the rider to claim, preventing customer-side griefing.
-- **Atomic two-sided funding.** Customer's fee and rider's bond move in a single transaction, eliminating asymmetric grief cases.
+- **Split two-sided funding.** Customer's fee and rider's bond arrive in separate single-signature transactions; unilateral withdrawal while un-funded eliminates asymmetric grief cases.
 - **Explicit allocation in disputes.** Admin must supply payouts that sum to exactly the pot — surfaces accounting mistakes on chain.
 - **Three-pot escrow.** Delivery fee, rider bond, and platform fee tracked separately for clean accounting and waiver flexibility.
 
