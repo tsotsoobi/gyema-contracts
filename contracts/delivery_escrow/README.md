@@ -23,7 +23,7 @@ A Soroban smart contract for two-sided delivery escrow on the Pi Network. Custom
 The contract implements a three-pot escrow with a confirmation window and admin-arbitrated disputes:
 
 1. **Customer** creates an order naming the rider, delivery fee, required bond, and window parameters.
-2. **Customer and rider both call `fund`** in a single transaction — customer's delivery fee and rider's bond move into the contract atomically.
+2. **Customer calls `fund_fee` and rider calls `stake_bond`**, each a single-signature transaction in either order — the order advances to `Funded` once both deposits have landed. While still `Open`, either party can reclaim their own deposit via `withdraw_deposit` or terminate the listing via `cancel_open`, so an absent counterparty can never lock funds.
 3. **Rider** calls `mark_delivered` when the delivery is complete, opening a confirmation window.
 4. Within the confirmation window, the **customer** can either `confirm_delivery` (standard payout) or `dispute` (freeze the escrow into the evidence window).
 5. If the customer is silent past the confirmation window, the **rider** can `claim_after_timeout` to receive the standard payout.
@@ -34,7 +34,8 @@ Key design properties:
 - **Timeout escape valve** — rider can claim after the window so customer silence isn't a permanent grief vector.
 - **Either side can dispute** — riders need dispute access too (fraudulent address, refused delivery, customer chargeback risk).
 - **Explicit allocation in disputes** — admin must supply amounts that sum to exactly the pot. Forces accounting discipline and surfaces mistakes early.
-- **Mutual cancel** — both parties can voluntarily unwind a Funded order before `mark_delivered` for a clean full refund.
+- **Single-signature everywhere** — no function requires two parties to sign one transaction. Dual `require_auth` proved impossible to orchestrate for two parties on separate devices (verified on Pi Testnet, 2026-06-10), so funding is split into `fund_fee` + `stake_bond` and cancellation into `propose_cancel` + `accept_cancel`.
+- **Consensual cancel of Funded orders** — either party proposes, the other accepts, full refund with no platform fee. Before funding completes, `cancel_open` is unilateral because no commitment exists yet.
 - **No partial fills** — an order is one delivery. No batching, no splits at the order layer.
 - **No self-dealing** — customer and rider must be distinct addresses.
 
@@ -51,8 +52,9 @@ Customer                  Contract                  Token Contract             R
    |--- approve(contract,fee)-------------------------> |                       |                     |
    |                                                      |<-- approve(bond) ---|                     |
    |                         |                            |                       |                     |
-   |-- fund ---------------> |-- transfer_from(fee) ---> |                       |                     |
-   |                         |-- transfer_from(bond) --> | <---------------------|                     |
+   |-- fund_fee -----------> |-- transfer_from(fee) ---> |                       |                     |
+   |                         |<-------------------------------- stake_bond ------|                     |
+   |                         |-- transfer_from(bond) --> |                       |                     |
    |   (Funded)              |                            |                       |                     |
    |                         |                            |                       |                     |
    |                         |<------- mark_delivered ---------------------------|                     |
@@ -106,7 +108,7 @@ Delivered -> rider marked complete, confirmation window open
 Disputed  -> dispute opened, evidence window open
 Released  -> standard happy-path payout completed (terminal)
 Resolved  -> admin-arbitrated payout completed (terminal)
-Cancelled -> mutual cancellation, full refund (terminal)
+Cancelled -> cancelled before delivery, deposits refunded (terminal)
 ```
 
 ### Allocation
@@ -118,7 +120,7 @@ Supplied by the admin when calling `resolve_dispute`. Must sum to exactly `deliv
 | `to_customer` | `i128` | Refund amount to the customer                                            |
 | `to_rider`    | `i128` | Payout to the rider (often = bond return + partial payment)              |
 | `to_platform` | `i128` | Platform fee. Admin may waive (set to 0) in refund scenarios.            |
-| `forfeit`     | `i128` | Slash amount, retained by the contract for explicit accounting separation|
+| `forfeit`     | `i128` | Slash amount, routed to the platform wallet, accounted separately         |
 
 ---
 
@@ -171,28 +173,50 @@ Creates a new order in `Open` state. No funds move yet.
 
 ---
 
-#### `fund`
+#### `fund_fee`
 
 ```rust
-fn fund(env: Env, order_id: u64) -> Result<Order, ContractError>
+fn fund_fee(env: Env, order_id: u64) -> Result<Order, ContractError>
 ```
 
-Atomically pulls the delivery fee from the customer and the bond from the rider into the contract. Advances state from `Open` to `Funded`.
+Pulls the delivery fee from the customer into the contract. The customer must have pre-approved the contract via `token.approve()`.
 
-Both parties must have pre-approved the contract via `token.approve()`.
-
-**Auth:** `customer` AND `rider` (both must sign).
+**Auth:** `customer` only.
 
 **Validation:**
 - Status must be `Open` -> `NotInOpenState`
+- Fee not already funded -> `AlreadyFunded`
 
 **Effects:**
 - `token.transfer_from(customer -> contract, delivery_fee)`
-- `token.transfer_from(rider -> contract, rider_bond)` (skipped if bond is 0)
-- Sets `status = Funded`
-- Emits `ord_fund` event
+- Sets `fee_funded = true`
+- Emits `fee_fund` event
+- If the bond is also in (or the order requires no bond): sets `status = Funded` and emits `ord_fund`
 
-**Rationale:** Combining funding and staking into one call prevents the asymmetric grief case where the customer funds and the rider never stakes, locking customer funds.
+**Rationale:** v1's `fund` required both parties to sign one transaction. That proved impossible to orchestrate for two parties on separate devices (verified on Pi Testnet, 2026-06-10: clients can only sign Soroban authorization entries for keys they hold). Splitting funding into two single-signature calls preserves the same escrow guarantees. The grief case where one party deposits and the other never does is handled by `withdraw_deposit` and `cancel_open`.
+
+---
+
+#### `stake_bond`
+
+```rust
+fn stake_bond(env: Env, order_id: u64) -> Result<Order, ContractError>
+```
+
+Pulls the bond from the rider into the contract. The rider must have pre-approved the contract via `token.approve()`. May be called before or after `fund_fee`.
+
+**Auth:** `rider` only.
+
+**Validation:**
+- Status must be `Open` -> `NotInOpenState`
+- Order must require a bond -> `InvalidBond` if `rider_bond` is 0
+- Bond not already staked -> `AlreadyFunded`
+
+**Effects:**
+- `token.transfer_from(rider -> contract, rider_bond)`
+- Sets `bond_funded = true`
+- Emits `bond_stk` event
+- If the fee is also in: sets `status = Funded` and emits `ord_fund`
 
 ---
 
@@ -314,23 +338,74 @@ Admin rules on the dispute after the evidence window. Supplies an explicit alloc
 
 ---
 
-### Mutual Cancellation
+### Cancellation and Withdrawal
 
-#### `mutual_cancel`
+#### `withdraw_deposit`
 
 ```rust
-fn mutual_cancel(env: Env, order_id: u64) -> Result<Order, ContractError>
+fn withdraw_deposit(env: Env, caller: Address, order_id: u64) -> Result<Order, ContractError>
 ```
 
-Both parties voluntarily cancel a Funded (or Open) order. Full refund: customer gets `delivery_fee` back, rider gets `rider_bond` back, no platform fee charged.
+Reclaim your own deposit from an order that is still `Open`. Unilateral; the order stays `Open` and can be funded again.
 
-**Auth:** `customer` AND `rider`.
+**Auth:** `caller` (must be the order's customer or rider).
 
-**Validation:** Status must be `Open` or `Funded` -> else `InvalidStatus`.
+**Validation:** Status must be `Open` -> `NotInOpenState`; caller must have a deposit in -> `NothingToWithdraw`.
+
+**Effects:** Refunds the caller's own deposit, clears the matching funded flag, emits `withdraw` event.
+
+---
+
+#### `cancel_open`
+
+```rust
+fn cancel_open(env: Env, caller: Address, order_id: u64) -> Result<Order, ContractError>
+```
+
+Terminate an `Open` order. Unilateral: before funding completes, no commitment exists, so this is equivalent to deleting a listing. Any deposits already made are refunded to their owners.
+
+**Auth:** `caller` (must be the order's customer or rider).
+
+**Validation:** Status must be `Open` -> `NotInOpenState`.
+
+**Effects:** Refunds any deposits to their respective owners, sets `status = Cancelled`, emits `cancel` event.
+
+---
+
+#### `propose_cancel`
+
+```rust
+fn propose_cancel(env: Env, caller: Address, order_id: u64) -> Result<Order, ContractError>
+```
+
+Propose cancelling a `Funded` order. Funds do not move until the counterparty accepts. Proposing again overwrites the previous proposal. Together with `accept_cancel` this replaces v1's dual-auth `mutual_cancel`.
+
+**Auth:** `caller` (must be the order's customer or rider).
+
+**Validation:** Status must be `Funded` -> `NotInFundedState`.
+
+**Effects:** Sets `cancel_proposed_by = caller`, emits `cnl_prop` event.
+
+---
+
+#### `accept_cancel`
+
+```rust
+fn accept_cancel(env: Env, caller: Address, order_id: u64) -> Result<Order, ContractError>
+```
+
+Accept the counterparty's cancellation proposal on a `Funded` order. Full refund: customer gets `delivery_fee` back, rider gets `rider_bond` back, no platform fee charged. Cancellation of a Funded order therefore still requires both parties' consent, expressed as two single-signature transactions.
+
+**Auth:** `caller` (must be the order's customer or rider).
+
+**Validation:**
+- Status must be `Funded` -> `NotInFundedState`
+- A proposal must exist -> `CancelNotProposed`
+- Caller must differ from the proposer -> `CannotAcceptOwnProposal`
 
 **Effects:**
-- If Funded: refunds both parties via `token.transfer`
-- Sets `status = Cancelled`
+- Refunds both parties via `token.transfer`
+- Sets `status = Cancelled`, clears `cancel_proposed_by`
 - Emits `cancel` event
 
 ---
@@ -404,13 +479,17 @@ The admin must construct an `Allocation` summing to `delivery_fee + rider_bond`.
 | Function              | Requires Auth                       | Notes                                       |
 |-----------------------|-------------------------------------|---------------------------------------------|
 | `create_order`        | `customer`                          | Customer is the party committing fee        |
-| `fund`                | `customer` AND `rider`              | Atomic two-sided commitment                 |
+| `fund_fee`            | `customer`                          | Customer's half of the funding              |
+| `stake_bond`          | `rider`                             | Rider's half of the funding                 |
 | `mark_delivered`      | `rider` (own order)                 | Only rider can declare delivery             |
 | `confirm_delivery`    | `customer` (own order)              | Only customer can verify receipt            |
 | `claim_after_timeout` | `rider` (own order)                 | After confirmation window expires           |
 | `dispute`             | `customer` OR `rider` (own order)   | Either side, within confirmation window     |
 | `resolve_dispute`     | `admin`                             | After evidence window expires               |
-| `mutual_cancel`       | `customer` AND `rider`              | Before delivery; full refund                |
+| `withdraw_deposit`    | `customer` OR `rider` (own deposit) | While Open; reclaim own deposit             |
+| `cancel_open`         | `customer` OR `rider` (own order)   | While Open; unilateral, refunds deposits    |
+| `propose_cancel`      | `customer` OR `rider` (own order)   | While Funded; no funds move yet             |
+| `accept_cancel`       | the non-proposing party             | While Funded; full refund, both consent     |
 | `get_*`               | None                                | Public read                                 |
 | `upgrade`             | `admin`                             | Standard upgrade path                       |
 | `version`             | None                                | Public read                                 |
@@ -486,7 +565,7 @@ This ensures an order's data survives at least two full window cycles between mu
 
 ### TTL Bump Strategy
 
-TTL bumps are performed only in mutating functions (`create_order`, `fund`, `mark_delivered`, `confirm_delivery`, `claim_after_timeout`, `dispute`, `resolve_dispute`, `mutual_cancel`). Query functions do not bump TTLs because they are typically executed via `simulateTransaction`, where state changes are discarded.
+TTL bumps are performed only in mutating functions (`create_order`, `fund_fee`, `stake_bond`, `mark_delivered`, `confirm_delivery`, `claim_after_timeout`, `dispute`, `resolve_dispute`, `withdraw_deposit`, `cancel_open`, `propose_cancel`, `accept_cancel`). Query functions do not bump TTLs because they are typically executed via `simulateTransaction`, where state changes are discarded.
 
 Fully resolved orders (`Released`, `Resolved`, `Cancelled`) eventually expire from persistent storage — this is by design. Off-chain indexers should ingest events for permanent records.
 

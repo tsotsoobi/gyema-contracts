@@ -104,6 +104,13 @@ fn approve_both_parties(s: &Setup) {
     );
 }
 
+/// Complete the v2 split funding flow: customer funds the fee, rider stakes
+/// the bond. Order advances to Funded on the second call.
+fn fund_both(s: &Setup, order_id: u64) {
+    s.client.fund_fee(&order_id);
+    s.client.stake_bond(&order_id);
+}
+
 // ---------------------------------------------------------------------------
 // Happy paths
 // ---------------------------------------------------------------------------
@@ -118,13 +125,23 @@ fn test_create_order_emits_open_state() {
 }
 
 #[test]
-fn test_fund_moves_to_funded_state() {
+fn test_split_funding_advances_to_funded() {
     let s = setup();
     let order = create_default(&s);
     approve_both_parties(&s);
 
-    let funded = s.client.fund(&order.order_id);
+    // Fee alone: deposit recorded, order still Open.
+    let after_fee = s.client.fund_fee(&order.order_id);
+    assert_eq!(after_fee.status, OrderStatus::Open);
+    assert!(after_fee.fee_funded);
+    assert!(!after_fee.bond_funded);
+    assert_eq!(s.token.balance(&s.contract_addr), FEE);
+
+    // Bond lands second: order advances to Funded.
+    let funded = s.client.stake_bond(&order.order_id);
     assert_eq!(funded.status, OrderStatus::Funded);
+    assert!(funded.fee_funded);
+    assert!(funded.bond_funded);
     // Contract holds the pot.
     assert_eq!(s.token.balance(&s.contract_addr), FEE + BOND);
     // Customer down by FEE, rider down by BOND.
@@ -133,11 +150,58 @@ fn test_fund_moves_to_funded_state() {
 }
 
 #[test]
+fn test_bond_first_then_fee_also_advances() {
+    let s = setup();
+    let order = create_default(&s);
+    approve_both_parties(&s);
+
+    let after_bond = s.client.stake_bond(&order.order_id);
+    assert_eq!(after_bond.status, OrderStatus::Open);
+
+    let funded = s.client.fund_fee(&order.order_id);
+    assert_eq!(funded.status, OrderStatus::Funded);
+}
+
+#[test]
+fn test_zero_bond_order_funds_on_fee_alone() {
+    let s = setup();
+    let order = s.client.create_order(
+        &s.customer,
+        &s.rider,
+        &FEE,
+        &0i128,
+        &PLATFORM_BPS,
+        &(24 * HOUR),
+        &(48 * HOUR),
+        &String::from_str(&s.env, "ipfs://no-bond"),
+    );
+    approve_both_parties(&s);
+
+    let funded = s.client.fund_fee(&order.order_id);
+    assert_eq!(funded.status, OrderStatus::Funded);
+
+    // Staking a zero bond is rejected.
+    let result = s.client.try_stake_bond(&order.order_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_double_fund_fee_fails() {
+    let s = setup();
+    let order = create_default(&s);
+    approve_both_parties(&s);
+
+    s.client.fund_fee(&order.order_id);
+    let result = s.client.try_fund_fee(&order.order_id);
+    assert!(result.is_err());
+}
+
+#[test]
 fn test_full_happy_path_customer_confirms() {
     let s = setup();
     let order = create_default(&s);
     approve_both_parties(&s);
-    s.client.fund(&order.order_id);
+    fund_both(&s, order.order_id);
     s.client.mark_delivered(&s.rider, &order.order_id);
 
     let alloc = s.client.confirm_delivery(&s.customer, &order.order_id);
@@ -164,7 +228,7 @@ fn test_claim_after_timeout() {
     let s = setup();
     let order = create_default(&s);
     approve_both_parties(&s);
-    s.client.fund(&order.order_id);
+    fund_both(&s, order.order_id);
     s.client.mark_delivered(&s.rider, &order.order_id);
 
     advance(&s.env, 24 * HOUR + 1);
@@ -188,7 +252,7 @@ fn test_dispute_then_admin_resolves_partial_refund() {
     let s = setup();
     let order = create_default(&s);
     approve_both_parties(&s);
-    s.client.fund(&order.order_id);
+    fund_both(&s, order.order_id);
     s.client.mark_delivered(&s.rider, &order.order_id);
 
     // Customer disputes within the confirmation window.
@@ -234,7 +298,7 @@ fn test_mark_delivered_by_non_rider_fails() {
     let s = setup();
     let order = create_default(&s);
     approve_both_parties(&s);
-    s.client.fund(&order.order_id);
+    fund_both(&s, order.order_id);
 
     let stranger = Address::generate(&s.env);
     let result = s.client.try_mark_delivered(&stranger, &order.order_id);
@@ -246,7 +310,7 @@ fn test_claim_before_window_elapses_fails() {
     let s = setup();
     let order = create_default(&s);
     approve_both_parties(&s);
-    s.client.fund(&order.order_id);
+    fund_both(&s, order.order_id);
     s.client.mark_delivered(&s.rider, &order.order_id);
 
     // Only 1 hour elapsed — window is 24h.
@@ -260,7 +324,7 @@ fn test_dispute_after_window_closes_fails() {
     let s = setup();
     let order = create_default(&s);
     approve_both_parties(&s);
-    s.client.fund(&order.order_id);
+    fund_both(&s, order.order_id);
     s.client.mark_delivered(&s.rider, &order.order_id);
 
     advance(&s.env, 24 * HOUR + 1);
@@ -273,7 +337,7 @@ fn test_resolve_before_evidence_window_fails() {
     let s = setup();
     let order = create_default(&s);
     approve_both_parties(&s);
-    s.client.fund(&order.order_id);
+    fund_both(&s, order.order_id);
     s.client.mark_delivered(&s.rider, &order.order_id);
     s.client.dispute(&s.customer, &order.order_id);
 
@@ -295,7 +359,7 @@ fn test_resolve_allocation_sum_mismatch_fails() {
     let s = setup();
     let order = create_default(&s);
     approve_both_parties(&s);
-    s.client.fund(&order.order_id);
+    fund_both(&s, order.order_id);
     s.client.mark_delivered(&s.rider, &order.order_id);
     s.client.dispute(&s.customer, &order.order_id);
     advance(&s.env, 48 * HOUR + 1);
@@ -330,13 +394,15 @@ fn test_self_deal_blocked() {
 }
 
 #[test]
-fn test_mutual_cancel_refunds_both_parties() {
+fn test_propose_accept_cancel_refunds_both_parties() {
     let s = setup();
     let order = create_default(&s);
     approve_both_parties(&s);
-    s.client.fund(&order.order_id);
+    fund_both(&s, order.order_id);
 
-    s.client.mutual_cancel(&order.order_id);
+    // Customer proposes, rider accepts: two single-auth calls.
+    s.client.propose_cancel(&s.customer, &order.order_id);
+    s.client.accept_cancel(&s.rider, &order.order_id);
 
     assert_eq!(s.token.balance(&s.customer), INITIAL_BALANCE);
     assert_eq!(s.token.balance(&s.rider), INITIAL_BALANCE);
@@ -345,4 +411,106 @@ fn test_mutual_cancel_refunds_both_parties() {
         s.client.get_order(&order.order_id).status,
         OrderStatus::Cancelled
     );
+}
+
+#[test]
+fn test_accept_own_cancel_proposal_fails() {
+    let s = setup();
+    let order = create_default(&s);
+    approve_both_parties(&s);
+    fund_both(&s, order.order_id);
+
+    s.client.propose_cancel(&s.customer, &order.order_id);
+    let result = s.client.try_accept_cancel(&s.customer, &order.order_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_accept_cancel_without_proposal_fails() {
+    let s = setup();
+    let order = create_default(&s);
+    approve_both_parties(&s);
+    fund_both(&s, order.order_id);
+
+    let result = s.client.try_accept_cancel(&s.rider, &order.order_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_withdraw_deposit_while_open() {
+    let s = setup();
+    let order = create_default(&s);
+    approve_both_parties(&s);
+
+    // Customer funds, rider never shows. Customer reclaims unilaterally.
+    s.client.fund_fee(&order.order_id);
+    assert_eq!(s.token.balance(&s.customer), INITIAL_BALANCE - FEE);
+
+    let after = s.client.withdraw_deposit(&s.customer, &order.order_id);
+    assert_eq!(after.status, OrderStatus::Open);
+    assert!(!after.fee_funded);
+    assert_eq!(s.token.balance(&s.customer), INITIAL_BALANCE);
+    assert_eq!(s.token.balance(&s.contract_addr), 0);
+
+    // Nothing left to withdraw.
+    let result = s.client.try_withdraw_deposit(&s.customer, &order.order_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_cancel_open_refunds_partial_deposits() {
+    let s = setup();
+    let order = create_default(&s);
+    approve_both_parties(&s);
+
+    // Only the rider has deposited; customer kills the listing.
+    s.client.stake_bond(&order.order_id);
+    s.client.cancel_open(&s.customer, &order.order_id);
+
+    assert_eq!(s.token.balance(&s.customer), INITIAL_BALANCE);
+    assert_eq!(s.token.balance(&s.rider), INITIAL_BALANCE);
+    assert_eq!(s.token.balance(&s.contract_addr), 0);
+    assert_eq!(
+        s.client.get_order(&order.order_id).status,
+        OrderStatus::Cancelled
+    );
+}
+
+#[test]
+fn test_withdraw_after_funded_fails() {
+    let s = setup();
+    let order = create_default(&s);
+    approve_both_parties(&s);
+    fund_both(&s, order.order_id);
+
+    let result = s.client.try_withdraw_deposit(&s.customer, &order.order_id);
+    assert!(result.is_err());
+    let result = s.client.try_cancel_open(&s.customer, &order.order_id);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_forfeit_routes_to_platform_wallet() {
+    let s = setup();
+    let order = create_default(&s);
+    approve_both_parties(&s);
+    fund_both(&s, order.order_id);
+    s.client.mark_delivered(&s.rider, &order.order_id);
+    s.client.dispute(&s.customer, &order.order_id);
+    advance(&s.env, 48 * HOUR + 1);
+
+    // Slashing ruling: rider's bond is forfeited.
+    let pot = FEE + BOND;
+    let alloc = Allocation {
+        to_customer: FEE,
+        to_rider: 0,
+        to_platform: 0,
+        forfeit: pot - FEE,
+    };
+    s.client.resolve_dispute(&s.admin, &order.order_id, &alloc);
+
+    // Forfeit must NOT remain locked in the contract.
+    assert_eq!(s.token.balance(&s.contract_addr), 0);
+    assert_eq!(s.token.balance(&s.platform_wallet), BOND);
+    assert_eq!(s.token.balance(&s.customer), INITIAL_BALANCE);
 }

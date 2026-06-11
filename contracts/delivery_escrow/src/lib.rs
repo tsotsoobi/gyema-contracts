@@ -66,6 +66,9 @@ pub enum ContractError {
     TimestampOverflow = 16,
     SelfDealNotAllowed = 17,
     AlreadyFunded = 18,
+    NothingToWithdraw = 19,
+    CancelNotProposed = 20,
+    CannotAcceptOwnProposal = 21,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,18 +95,19 @@ pub enum DataKey {
 /// Lifecycle of a single delivery order.
 ///
 /// ```
-/// Open --(fund)--> Funded --(mark_delivered)--> Delivered
-///                                                  |
-///                              +-------------------+--------------------+
-///                              | (confirm)         | (dispute)          | (claim_after_timeout)
-///                              v                   v                    v
-///                           Released            Disputed             Released
-///                                                  |
-///                                              (resolve)
-///                                                  v
-///                                              Resolved
+/// Open --(fund_fee + stake_bond)--> Funded --(mark_delivered)--> Delivered
+///                                                                   |
+///                            +--------------------+----------------+------+
+///                            | (confirm)          | (dispute)             | (claim_after_timeout)
+///                            v                    v                       v
+///                         Released             Disputed                Released
+///                                                                  |
+///                                                              (resolve)
+///                                                                  v
+///                                                              Resolved
 ///
-/// Open / Funded --(mutual_cancel)--> Cancelled
+/// Open --(cancel_open, either party)--> Cancelled
+/// Funded --(propose_cancel then accept_cancel)--> Cancelled
 /// ```
 #[derive(Clone, Copy, PartialEq, Debug)]
 #[contracttype]
@@ -144,6 +148,14 @@ pub struct Order {
     pub disputed_at: u64,
     /// Optional metadata pointer (e.g. IPFS hash of order details, route, photos).
     pub metadata_uri: String,
+    /// True once the customer's `delivery_fee` has been pulled into escrow.
+    pub fee_funded: bool,
+    /// True once the rider's `rider_bond` has been pulled into escrow.
+    /// Always false when `rider_bond` is 0 (there is nothing to stake).
+    pub bond_funded: bool,
+    /// Set by `propose_cancel` on a Funded order; cleared on terminal states.
+    /// `accept_cancel` requires the acceptor to differ from the proposer.
+    pub cancel_proposed_by: Option<Address>,
 }
 
 /// Resolution payout instruction supplied by the admin when ruling a dispute.
@@ -157,9 +169,9 @@ pub struct Allocation {
     pub to_customer: i128,
     pub to_rider: i128,
     pub to_platform: i128,
-    /// Burn / forfeit (kept by the contract or rolled to platform). Use 0
-    /// in normal cases; non-zero only for slashing scenarios where the admin
-    /// wants explicit accounting separation.
+    /// Slashed amount, routed to the platform wallet but accounted separately
+    /// from `to_platform` so slashing is visible in events. Use 0 in normal
+    /// cases; non-zero only for slashing scenarios.
     pub forfeit: i128,
 }
 
@@ -257,6 +269,22 @@ fn append_to_index(env: &Env, key: &DataKey, order_id: u64, life_secs: u64) {
     bump_persistent(env, key, life_secs);
 }
 
+/// Flip an Open order to Funded once every required deposit has landed.
+/// A zero bond means the fee alone completes funding. Emits `ord_fund` at
+/// the moment of transition. Caller is responsible for saving the order.
+fn advance_if_fully_funded(env: &Env, order: &mut Order) {
+    if order.status != OrderStatus::Open {
+        return;
+    }
+    if order.fee_funded && (order.rider_bond == 0 || order.bond_funded) {
+        order.status = OrderStatus::Funded;
+        env.events().publish(
+            (symbol_short!("ord_fund"),),
+            (order.order_id, order.delivery_fee, order.rider_bond),
+        );
+    }
+}
+
 fn require_status(order: &Order, expected: OrderStatus) -> Result<(), ContractError> {
     if order.status == expected {
         return Ok(());
@@ -326,7 +354,13 @@ fn execute_payout(env: &Env, order: &Order, a: &Allocation) {
         let pw = get_platform_wallet(env);
         token_client.transfer(&contract_addr, &pw, &a.to_platform);
     }
-    // forfeit stays in the contract balance; if non-zero, surface it via event.
+    // Forfeit is routed to the platform wallet as well (the contract has no
+    // withdrawal path, so leaving it here would lock it forever). It stays a
+    // separate Allocation field so slashing remains visible in events.
+    if a.forfeit > 0 {
+        let pw = get_platform_wallet(env);
+        token_client.transfer(&contract_addr, &pw, &a.forfeit);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +385,7 @@ impl DeliveryEscrowContract {
     /// Create a new escrow order. The customer specifies the rider, delivery
     /// fee, required bond, and platform parameters. The order starts in
     /// `Open` state — no funds have moved yet. The customer must then call
-    /// `fund` and the rider must call `stake_bond` to advance to `Funded`.
+    /// `fund_fee` and the rider must call `stake_bond` to advance to `Funded`.
     ///
     /// We separate `create` from `fund` so the customer can review the rider's
     /// acceptance before parting with funds, and so a frontend can show the
@@ -407,6 +441,9 @@ impl DeliveryEscrowContract {
             delivered_at: 0,
             disputed_at: 0,
             metadata_uri,
+            fee_funded: false,
+            bond_funded: false,
+            cancel_proposed_by: None,
         };
 
         save_order(&env, &order);
@@ -421,28 +458,32 @@ impl DeliveryEscrowContract {
         Ok(order)
     }
 
-    /// Customer funds the delivery fee into the contract, AND the rider
-    /// simultaneously stakes their bond. We require both transfers in a
-    /// single call so the order atomically advances from `Open` to `Funded`.
-    /// Both parties must have pre-approved the contract for their respective
-    /// amounts via `token.approve()`.
+    /// Customer funds the delivery fee into escrow. Single-auth: only the
+    /// customer signs. The customer must have pre-approved the contract for
+    /// `delivery_fee` via `token.approve()`.
     ///
-    /// Combining funding and staking into one transaction prevents the
-    /// griefing case where a customer funds and the rider never stakes
-    /// (leaving customer funds locked).
-    pub fn fund(env: Env, order_id: u64) -> Result<Order, ContractError> {
+    /// Funding is split into `fund_fee` (customer) and `stake_bond` (rider)
+    /// because requiring both signatures in one transaction proved
+    /// impossible to orchestrate for two parties on separate devices
+    /// (verified on Pi Testnet, 2026-06-10: clients can sign Soroban
+    /// authorization entries only for keys they hold). The order advances to
+    /// `Funded` once both deposits have landed, in either call order. The
+    /// griefing case where one party deposits and the other never does is
+    /// handled by `withdraw_deposit` and `cancel_open`, which let anyone
+    /// reclaim their own money while the order is still `Open`.
+    pub fn fund_fee(env: Env, order_id: u64) -> Result<Order, ContractError> {
         let mut order = load_order(&env, order_id)?;
         require_status(&order, OrderStatus::Open)?;
+        if order.fee_funded {
+            return Err(ContractError::AlreadyFunded);
+        }
 
-        // Both parties must consent — customer's funds + rider's bond move now.
         order.customer.require_auth();
-        order.rider.require_auth();
 
         let token = get_token(&env);
         let token_client = TokenClient::new(&env, &token);
         let contract_addr = env.current_contract_address();
 
-        // Pull the customer's delivery fee.
         token_client.transfer_from(
             &contract_addr,
             &order.customer,
@@ -450,24 +491,55 @@ impl DeliveryEscrowContract {
             &order.delivery_fee,
         );
 
-        // Pull the rider's bond (if any).
-        if order.rider_bond > 0 {
-            token_client.transfer_from(
-                &contract_addr,
-                &order.rider,
-                &contract_addr,
-                &order.rider_bond,
-            );
-        }
+        order.fee_funded = true;
+        env.events().publish(
+            (symbol_short!("fee_fund"),),
+            (order.order_id, order.delivery_fee),
+        );
 
-        order.status = OrderStatus::Funded;
+        advance_if_fully_funded(&env, &mut order);
         save_order(&env, &order);
         bump_instance(&env);
 
-        env.events().publish(
-            (symbol_short!("ord_fund"),),
-            (order.order_id, order.delivery_fee, order.rider_bond),
+        Ok(order)
+    }
+
+    /// Rider stakes their bond into escrow. Single-auth: only the rider
+    /// signs. The rider must have pre-approved the contract for
+    /// `rider_bond` via `token.approve()`. Errors with `InvalidBond` when
+    /// the order requires no bond. See `fund_fee` for why funding is split.
+    pub fn stake_bond(env: Env, order_id: u64) -> Result<Order, ContractError> {
+        let mut order = load_order(&env, order_id)?;
+        require_status(&order, OrderStatus::Open)?;
+        if order.rider_bond == 0 {
+            return Err(ContractError::InvalidBond);
+        }
+        if order.bond_funded {
+            return Err(ContractError::AlreadyFunded);
+        }
+
+        order.rider.require_auth();
+
+        let token = get_token(&env);
+        let token_client = TokenClient::new(&env, &token);
+        let contract_addr = env.current_contract_address();
+
+        token_client.transfer_from(
+            &contract_addr,
+            &order.rider,
+            &contract_addr,
+            &order.rider_bond,
         );
+
+        order.bond_funded = true;
+        env.events().publish(
+            (symbol_short!("bond_stk"),),
+            (order.order_id, order.rider_bond),
+        );
+
+        advance_if_fully_funded(&env, &mut order);
+        save_order(&env, &order);
+        bump_instance(&env);
 
         Ok(order)
     }
@@ -655,34 +727,163 @@ impl DeliveryEscrowContract {
         Ok(allocation)
     }
 
-    // ---- Mutual cancellation ---------------------------------------------
+    // ---- Cancellation and withdrawal ---------------------------------------
 
-    /// Both parties mutually cancel a Funded order (e.g. customer changed
-    /// their mind, rider can't make the trip). Full refund: customer gets
-    /// delivery_fee back, rider gets bond back, no platform fee charged.
+    /// Reclaim your own deposit from an order that is still `Open` (i.e. not
+    /// yet fully funded). Single-auth, unilateral, no counterparty consent
+    /// needed: each party only ever touches their own money here. The order
+    /// stays `Open` and can be funded again.
     ///
-    /// Requires both parties' auth. Only allowed before `mark_delivered`.
-    pub fn mutual_cancel(env: Env, order_id: u64) -> Result<Order, ContractError> {
+    /// This is the anti-griefing escape hatch for the split funding flow: if
+    /// one party deposits and the other never shows up, the deposit is never
+    /// locked.
+    pub fn withdraw_deposit(
+        env: Env,
+        caller: Address,
+        order_id: u64,
+    ) -> Result<Order, ContractError> {
         let mut order = load_order(&env, order_id)?;
-        if order.status != OrderStatus::Funded && order.status != OrderStatus::Open {
-            return Err(ContractError::InvalidStatus);
-        }
-        order.customer.require_auth();
-        order.rider.require_auth();
+        require_status(&order, OrderStatus::Open)?;
 
-        if order.status == OrderStatus::Funded {
-            let token = get_token(&env);
-            let token_client = TokenClient::new(&env, &token);
-            let contract_addr = env.current_contract_address();
-            if order.delivery_fee > 0 {
-                token_client.transfer(&contract_addr, &order.customer, &order.delivery_fee);
+        if caller != order.customer && caller != order.rider {
+            return Err(ContractError::Unauthorized);
+        }
+        caller.require_auth();
+
+        let token = get_token(&env);
+        let token_client = TokenClient::new(&env, &token);
+        let contract_addr = env.current_contract_address();
+
+        let amount = if caller == order.customer {
+            if !order.fee_funded {
+                return Err(ContractError::NothingToWithdraw);
             }
-            if order.rider_bond > 0 {
-                token_client.transfer(&contract_addr, &order.rider, &order.rider_bond);
+            order.fee_funded = false;
+            token_client.transfer(&contract_addr, &order.customer, &order.delivery_fee);
+            order.delivery_fee
+        } else {
+            if !order.bond_funded {
+                return Err(ContractError::NothingToWithdraw);
             }
+            order.bond_funded = false;
+            token_client.transfer(&contract_addr, &order.rider, &order.rider_bond);
+            order.rider_bond
+        };
+
+        save_order(&env, &order);
+        bump_instance(&env);
+
+        env.events().publish(
+            (symbol_short!("withdraw"),),
+            (order.order_id, caller, amount),
+        );
+
+        Ok(order)
+    }
+
+    /// Terminate an `Open` order. Either party may do this unilaterally:
+    /// before the order is fully funded, no commitment exists yet, so this
+    /// is equivalent to deleting a listing. Any deposits already made are
+    /// refunded to their respective owners.
+    pub fn cancel_open(env: Env, caller: Address, order_id: u64) -> Result<Order, ContractError> {
+        let mut order = load_order(&env, order_id)?;
+        require_status(&order, OrderStatus::Open)?;
+
+        if caller != order.customer && caller != order.rider {
+            return Err(ContractError::Unauthorized);
+        }
+        caller.require_auth();
+
+        let token = get_token(&env);
+        let token_client = TokenClient::new(&env, &token);
+        let contract_addr = env.current_contract_address();
+
+        if order.fee_funded {
+            token_client.transfer(&contract_addr, &order.customer, &order.delivery_fee);
+            order.fee_funded = false;
+        }
+        if order.bond_funded {
+            token_client.transfer(&contract_addr, &order.rider, &order.rider_bond);
+            order.bond_funded = false;
         }
 
         order.status = OrderStatus::Cancelled;
+        save_order(&env, &order);
+        bump_instance(&env);
+
+        env.events()
+            .publish((symbol_short!("cancel"),), order.order_id);
+
+        Ok(order)
+    }
+
+    /// Propose cancelling a `Funded` order (e.g. customer changed their
+    /// mind, rider can't make the trip). Single-auth: either party may
+    /// propose. Funds do not move until the other party accepts via
+    /// `accept_cancel`. Proposing again overwrites the previous proposal.
+    ///
+    /// This pair replaces v1's `mutual_cancel`, which required both
+    /// signatures in one transaction (see `fund_fee` for why that fails).
+    pub fn propose_cancel(
+        env: Env,
+        caller: Address,
+        order_id: u64,
+    ) -> Result<Order, ContractError> {
+        let mut order = load_order(&env, order_id)?;
+        require_status(&order, OrderStatus::Funded)?;
+
+        if caller != order.customer && caller != order.rider {
+            return Err(ContractError::Unauthorized);
+        }
+        caller.require_auth();
+
+        order.cancel_proposed_by = Some(caller.clone());
+        save_order(&env, &order);
+        bump_instance(&env);
+
+        env.events()
+            .publish((symbol_short!("cnl_prop"),), (order.order_id, caller));
+
+        Ok(order)
+    }
+
+    /// Accept the counterparty's cancellation proposal on a `Funded` order.
+    /// Full refund: customer gets `delivery_fee` back, rider gets the bond
+    /// back, no platform fee charged. The acceptor must differ from the
+    /// proposer, so cancellation still requires both parties' consent, just
+    /// expressed in two single-auth transactions instead of one dual-auth
+    /// transaction.
+    pub fn accept_cancel(env: Env, caller: Address, order_id: u64) -> Result<Order, ContractError> {
+        let mut order = load_order(&env, order_id)?;
+        require_status(&order, OrderStatus::Funded)?;
+
+        if caller != order.customer && caller != order.rider {
+            return Err(ContractError::Unauthorized);
+        }
+        caller.require_auth();
+
+        match &order.cancel_proposed_by {
+            None => return Err(ContractError::CancelNotProposed),
+            Some(proposer) => {
+                if *proposer == caller {
+                    return Err(ContractError::CannotAcceptOwnProposal);
+                }
+            }
+        }
+
+        let token = get_token(&env);
+        let token_client = TokenClient::new(&env, &token);
+        let contract_addr = env.current_contract_address();
+
+        if order.delivery_fee > 0 {
+            token_client.transfer(&contract_addr, &order.customer, &order.delivery_fee);
+        }
+        if order.rider_bond > 0 {
+            token_client.transfer(&contract_addr, &order.rider, &order.rider_bond);
+        }
+
+        order.status = OrderStatus::Cancelled;
+        order.cancel_proposed_by = None;
         save_order(&env, &order);
         bump_instance(&env);
 
@@ -745,7 +946,7 @@ impl DeliveryEscrowContract {
     }
 
     pub fn version(_env: Env) -> u32 {
-        1
+        2
     }
 }
 
