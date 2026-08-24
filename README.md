@@ -2,19 +2,21 @@
 
 Soroban smart contracts for [Gyema](https://github.com/tsotsoobi/gyema-app) — a decentralized peer-to-peer logistics app on Pi Network.
 
-> **Status: pre-deployment, unaudited.** These contracts are not yet deployed to any network. Do not use in production. See [Status](#status) below.
+> **Status: deployed on Pi Testnet, unaudited, not on Mainnet.** Escrow v2 is deployed and proven on Pi Testnet only. It is not on Pi Mainnet, it is not wired into any shipped product, and no real value has ever passed through it. Do not use in production. See [Status](#status) below.
 
 ## What this is
 
-A Cargo workspace of Soroban smart contracts intended for Pi Network Mainnet (Protocol 23+, Stellar Core v23.0.1). The first contract, `delivery_escrow`, implements a two-sided escrow for delivery orders: customers fund delivery fees, riders stake performance bonds, and funds release on customer confirmation, rider timeout claim, or admin-arbitrated dispute resolution.
+A Cargo workspace of Soroban smart contracts intended for Pi Network Mainnet, currently deployed and exercised on Pi Testnet at Protocol 26. The first contract, `delivery_escrow`, implements a two-sided escrow for delivery orders: customers fund delivery fees, riders stake performance bonds, and funds release on customer confirmation, rider timeout claim, or admin-arbitrated dispute resolution.
 
-This repo is a companion to [gyema-app](https://github.com/tsotsoobi/gyema-app), the customer-facing Pi Browser application. The app currently uses `Pi.createPayment()` for V1 (launching ahead of the December 19, 2026 gyema.pi domain claim deadline). These contracts are the V2 layer, intended for deployment once the Pi Core Team opens Soroban deployment access to third-party apps.
+This repo is a companion to [gyema-app](https://github.com/tsotsoobi/gyema-app), the customer-facing Pi Browser application. The app ships today on `Pi.createPayment()`, ahead of the December 19, 2026 gyema.pi domain claim deadline. These contracts are the escrow layer for a later product phase, and their Mainnet deployment waits on Pi Core Team guidance.
+
+A note on naming, because two numbering schemes meet in this repo. Product phases are described in words here, not numbers. Where you see escrow v1 and escrow v2, those are deployed contract generations: escrow v1 is abandoned, escrow v2 is the current Pi Testnet instance and the code in this repo.
 
 ## Contracts
 
 | Contract | Purpose | Status |
 |---|---|---|
-| [`delivery_escrow`](contracts/delivery_escrow/) | Two-sided delivery escrow with dispute resolution | Reference implementation; not deployed |
+| [`delivery_escrow`](contracts/delivery_escrow/) | Two-sided delivery escrow with dispute resolution | Escrow v2 deployed on Pi Testnet; not on Mainnet |
 
 ## Quick start
 
@@ -59,7 +61,7 @@ gyema-contracts/
 
 ## Design philosophy
 
-The contracts in this repo follow the patterns established by [PiNetwork/SmartContracts](https://github.com/PiNetwork/SmartContracts) (the Pi Core Team's reference subscription contract): same workspace structure, same `soroban-sdk = "22.0.0"` pin, same TTL management discipline, same error / event / storage-key conventions. This deliberate alignment is intended to make the contracts ergonomic for anyone familiar with the official reference and easier to review by the Pi developer community.
+The contracts in this repo follow the patterns established by [PiNetwork/SmartContracts](https://github.com/PiNetwork/SmartContracts) (the Pi Core Team's reference subscription contract): same workspace structure, the same TTL management discipline, the same error / event / storage-key conventions. This repo pins `soroban-sdk = "23.5.3"`, per the workspace `Cargo.toml`. This deliberate alignment is intended to make the contracts ergonomic for anyone familiar with the official reference and easier to review by the Pi developer community.
 
 For the delivery escrow specifically, the design optimizes for known fraud-resistance patterns in two-sided marketplaces:
 
@@ -73,21 +75,22 @@ Full design rationale and tradeoffs are in [`contracts/delivery_escrow/README.md
 
 ## Status
 
-**Pre-deployment.** As of the latest commit, no contract in this repo has been deployed to Pi Mainnet or Testnet. The reasons:
+**Deployed on Pi Testnet. Not on Mainnet. At rest.** Where things stand:
 
-1. The Pi Core Team announced Protocol 23 (Soroban enablement) Mainnet rollout on May 20, 2026 but has not yet published the developer pipeline for third-party apps to deploy Soroban contracts.
-2. Gyema's V1 product launch (using `Pi.createPayment()` only) is the priority through December 19, 2026.
+1. Escrow v2 is deployed on Pi Testnet and its lifecycle has been exercised there. Nothing is deployed to Pi Mainnet, nothing is reachable by Gyema app users, and no real value has ever passed through it.
+2. Gyema's product ships on `Pi.createPayment()` ahead of the December 19, 2026 gyema.pi domain claim deadline.
 3. These contracts have not been independently audited.
+4. Mainnet deployment waits on Pi Core Team guidance.
 
 **What you can safely do today:** read the code, run the tests locally, suggest improvements via Issues or PRs, fork for your own experiments.
 
-**What you should not do:** deploy to a live network and route real funds through these contracts. Wait for an audit and explicit production-readiness in this README.
+**What you should not do:** route real value through these contracts, on any network. Testnet deployment is not a readiness signal. Wait for an audit and for explicit production-readiness in this README.
 
 ## Roadmap
 
-- **V1 (current):** `delivery_escrow` reference implementation. Local tests pass.
-- **V2 (post Pi Mainnet Soroban access):** Testnet deployment, integration with `gyema-app` frontend, security audit, mainnet deployment.
-- **V3 (post-volume):** Multi-arbiter dispute resolution (currently single-admin), risk-tiered bonds, cross-app composability.
+- **Now:** escrow v2 deployed and proven on Pi Testnet. Track at rest.
+- **When Mainnet deployment is cleared:** security audit, integration with the `gyema-app` frontend, Mainnet deployment.
+- **Post-volume:** multi-arbiter dispute resolution (currently single-admin), risk-tiered bonds, cross-app composability.
 
 ## Contributing
 

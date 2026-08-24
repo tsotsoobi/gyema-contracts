@@ -428,7 +428,7 @@ All query functions are read-only and do not bump TTLs.
 | Function                            | Description                  | Auth    |
 |-------------------------------------|------------------------------|---------|
 | `upgrade(new_wasm_hash)`            | Replace contract WASM        | `admin` |
-| `version()`                         | Returns contract version (1) | None    |
+| `version()`                         | Returns contract version (2) | None    |
 
 ---
 
@@ -500,16 +500,20 @@ All authenticated functions use `require_auth()` and verify the caller matches t
 
 ## Events
 
-| Symbol     | Description                          | Data                                          |
-|------------|--------------------------------------|-----------------------------------------------|
-| `ord_new`  | Order created                        | `Order` struct                                |
-| `ord_fund` | Order funded by both parties         | `(order_id, delivery_fee, rider_bond)`        |
-| `delivrd`  | Rider marked delivered               | `(order_id, delivered_at)`                    |
-| `released` | Standard payout completed            | `(order_id, Allocation)`                      |
-| `disputed` | Dispute opened                       | `(order_id, disputing_party, disputed_at)`    |
-| `resolved` | Admin-arbitrated payout completed    | `(order_id, Allocation)`                      |
-| `cancel`   | Order mutually cancelled             | `order_id`                                    |
-| `upgrade`  | Contract WASM upgraded               | `new_wasm_hash`                               |
+| Symbol     | Description                             | Data                                       |
+|------------|-----------------------------------------|--------------------------------------------|
+| `ord_new`  | Order created                           | `Order` struct                             |
+| `fee_fund` | Customer funded the delivery fee        | `(order_id, delivery_fee)`                 |
+| `bond_stk` | Rider staked the bond                   | `(order_id, rider_bond)`                   |
+| `ord_fund` | Order funded by both parties            | `(order_id, delivery_fee, rider_bond)`     |
+| `delivrd`  | Rider marked delivered                  | `(order_id, delivered_at)`                 |
+| `released` | Standard payout completed               | `(order_id, Allocation)`                   |
+| `disputed` | Dispute opened                          | `(order_id, disputing_party, disputed_at)` |
+| `resolved` | Admin-arbitrated payout completed       | `(order_id, Allocation)`                   |
+| `withdraw` | Party reclaimed own deposit while Open  | `(order_id, caller, amount)`               |
+| `cnl_prop` | Cancellation proposed on a Funded order | `(order_id, proposer)`                     |
+| `cancel`   | Order cancelled, deposits refunded      | `order_id`                                 |
+| `upgrade`  | Contract WASM upgraded                  | `new_wasm_hash`                            |
 
 ---
 
@@ -577,9 +581,11 @@ Fully resolved orders (`Released`, `Resolved`, `Cancelled`) eventually expire fr
 
 The customer is the only party with verifiable knowledge of correct delivery. A rider-confirms flow has been repeatedly exploited in two-sided delivery markets: the rider marks delivered, vanishes with the bond intact, and the customer has no recourse during the confirmation phase. The customer-confirms-primary model with a rider timeout escape valve is the converged best practice (Uber Eats, DoorDash, Wolt, Glovo all use variants of this).
 
-### Why fund is atomic two-sided
+### Why funding is split into two single-signature calls
 
-If `fund_customer` and `stake_bond` were separate calls, a malicious rider could accept an order, never stake, and grief the customer by leaving their funds locked. Atomic two-sided funding eliminates this attack surface — the order either advances cleanly to `Funded` or fails entirely.
+Escrow v1 exposed a single `fund` that called `require_auth()` on both the customer and the rider in one invocation. That proved unorchestratable in practice. The CLI cannot co-sign a second party's Soroban authorization entry, and Pi Wallet exposes no Soroban signing UI, so two Pioneers on two separate phones could never co-sign one call. Verified on Pi Testnet, 2026-06-10.
+
+v2 splits funding into `fund_fee` (customer signs) and `stake_bond` (rider signs), callable in either order. The grief case the dual-auth version was meant to prevent, where one party deposits and the counterparty never does, is handled instead by `withdraw_deposit` and `cancel_open`, both available unilaterally while the order is `Open`.
 
 ### Why explicit allocations in resolve_dispute
 
@@ -600,6 +606,6 @@ Rather than building a fixed set of "ruling templates," the admin supplies the f
 
 ## Pi Network specifics
 
-- Built against `soroban-sdk = "22.0.0"`. Compatible with Pi Mainnet Protocol 23 (Soroban-enabled) once deployment access opens to third-party apps.
+- Built against `soroban-sdk = "23.5.3"`, the pin in the workspace `Cargo.toml`. Deployed and exercised on Pi Testnet at Protocol 26, the same protocol Pi Mainnet runs. The contract has not been deployed to or tested on Mainnet.
 - Designed to be called from a Pi Browser-hosted frontend via the Pi SDK once Pi exposes Soroban invocation. In the interim, server-side Horizon RPC calls (with Pi Wallet signing for user transactions) provide an integration path.
 - Native Pi is expected to be wrapped as a Stellar Asset Contract for use as the `token` parameter at construction.
