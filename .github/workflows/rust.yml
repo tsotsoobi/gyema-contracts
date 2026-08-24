@@ -16,11 +16,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-          targets: wasm32-unknown-unknown
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain
       - name: Cache cargo registry and target
         uses: actions/cache@v5
         with:
@@ -28,21 +25,19 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-check-
       - name: cargo check (workspace)
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
 
   fmt:
     name: cargo fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
@@ -51,10 +46,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain
       - name: Cache cargo registry and target
         uses: actions/cache@v5
         with:
@@ -62,19 +55,19 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-clippy-
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   test:
     name: cargo test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain
       - name: Cache cargo registry and target
         uses: actions/cache@v5
         with:
@@ -82,21 +75,19 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-test-
       - name: cargo test (workspace)
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
   wasm-build:
     name: Build Soroban WASM
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show active-toolchain
       - name: Cache cargo registry and target
         uses: actions/cache@v5
         with:
@@ -104,11 +95,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-wasm-
       - name: Build release WASM
-        run: cargo build --workspace --release --target wasm32-unknown-unknown
+        run: cargo build --locked --workspace --release --target wasm32-unknown-unknown
       - name: Upload WASM artifacts
         uses: actions/upload-artifact@v5
         with:
